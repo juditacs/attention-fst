@@ -16,70 +16,15 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 from loss import masked_cross_entropy
+from data import LabeledDataset
 
 
 def parse_args():
     p = ArgumentParser()
     return p.parse_args()
-
-
-class LabeledDataset(Dataset):
-    def __init__(self, stream):
-        super().__init__()
-        self._load_stream(stream)
-
-    def _load_stream(self, stream):
-        self.raw_enc = []
-        self.raw_dec = []
-        for line in stream:
-            enc, dec = line.rstrip("\n").split("\t")
-            self.raw_enc.append(enc.split(" "))
-            self.raw_dec.append(dec.split(" "))
-
-        self.maxlen_enc = max(len(r) for r in self.raw_enc)
-        self.maxlen_dec = max(len(r) for r in self.raw_dec)
-
-        self._create_padded_matrices()
-
-    def _create_padded_matrices(self):
-        self.vocab_enc = {'PAD': 0, 'UNK': 3}
-        self.vocab_dec = {'PAD': 0, 'SOS': 1, 'EOS': 2, 'UNK': 3, '<STEP>': 4}
-
-        x = []
-        y = []
-
-
-        for i in range(len(self.raw_enc)):
-            UNK = self.vocab_enc['UNK']
-            enc = self.raw_enc[i]
-            padded = enc + ['PAD'] * (self.maxlen_enc-len(enc))
-            x.append([self.vocab_enc.setdefault(c, len(self.vocab_enc)) for c in padded])
-
-            dec = self.raw_dec[i]
-            padded = dec + ['EOS'] + ['PAD'] * (self.maxlen_dec-len(dec))
-            y.append([self.vocab_dec.setdefault(c, len(self.vocab_dec)) for c in padded])
-
-        self.enc_len = [len(enc) for enc in self.raw_enc]
-        self.dec_len = [len(dec)+1 for dec in self.raw_dec]
-        self.maxlen_dec += 1
-        self.X = np.array(x)
-        self.Y = np.array(y)
-
-    def __len__(self):
-        return self.X.shape[0]
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx], self.enc_len[idx], self.dec_len[idx]
-
-    @staticmethod
-    def create_sos_vector(batch_size):
-        vec = Variable(torch.LongTensor(np.ones(batch_size)))
-        if use_cuda:
-            vec = vec.cuda()
-        return vec
 
 
 class EncoderRNN(nn.Module):
@@ -116,11 +61,9 @@ class DecoderRNN(nn.Module):
     def forward(self, input_seq, encoder_output, last_hidden):
         bs = input_seq.size(0)
         embedded = self.embedding(input_seq)
-        # embedded = embedded.view(1, batch_size, embedded.size(-1))
-        rnn_input = torch.cat((embedded, encoder_output.unsqueeze(0)), 1)
+        rnn_input = torch.cat((embedded, encoder_output), 1)
         rnn_input = rnn_input.view(1, *rnn_input.size())
         rnn_output, hidden = self.cell(rnn_input, last_hidden)
-        # out = F.softmax(rnn_output, dim=-1)
         output = self.out(rnn_output)
         return output, hidden
 
@@ -144,24 +87,24 @@ def train(encoder, decoder, data):
             all_output = Variable(torch.zeros(Y.size(0), Y.size(1), len(data.dataset.vocab_dec)))
             if use_cuda:
                 all_output = all_output.cuda()
-            for bi in range(Y.size(0)):
-                y = Y[bi]
-                enc_out = outputs[bi]
-                dec_input = LabeledDataset.create_sos_vector(1)
-                attn_pos = 0
-                hidden = tuple(e[[0], [bi], :].unsqueeze(1).contiguous() for e in enc_hidden)
-                all_attn_pos = []
-                for ti in range(Y.size(1)):
-                    out, hidden = decoder(dec_input, enc_out[attn_pos], hidden)
-                    topv, topi = out.data.topk(1)
-                    # FIXME hardcoded STEP symbol (4)
-                    if int(topi[0][0]) == 4:
-                        attn_pos = min(attn_pos+1, enc_out.size(0)-1)
-                    all_attn_pos.append(attn_pos)
-                    dec_input = Y[bi, ti]
-                    all_output[bi, ti] = out
-                if epoch % 10 == 9 and bi < 5:
-                    print(" ".join(map(str, all_attn_pos)))
+
+            enc_out = outputs
+            dec_input = LabeledDataset.create_sos_vector(X.size(0))
+            attn_pos = Variable(torch.LongTensor([0] * X.size(0)))
+            range_helper = Variable(torch.LongTensor(np.arange(X.size(0))), requires_grad=False)
+            if use_cuda:
+                attn_pos = attn_pos.cuda()
+                range_helper = range_helper.cuda()
+            hidden = tuple(e[[0], :, :].contiguous() for e in enc_hidden)
+            for ti in range(Y.size(1)):
+                out, hidden = decoder(dec_input, enc_out[range_helper, attn_pos], hidden)
+                topv, topi = out.max(-1)
+                attn_pos = attn_pos + torch.eq(topi, 4).long()
+                attn_pos = torch.clamp(attn_pos, 0, X.size(1)-1)
+                attn_pos = attn_pos.squeeze(0).contiguous()
+                dec_input = Y[:, ti].contiguous()
+                all_output[:, ti] = out
+
             enc_opt.zero_grad()
             dec_opt.zero_grad()
             loss = masked_cross_entropy(all_output.contiguous(), Y, tgt_len)
@@ -169,13 +112,12 @@ def train(encoder, decoder, data):
             loss.backward()
             enc_opt.step()
             dec_opt.step()
-        print(epoch, epoch_loss)
+        print(epoch, epoch_loss / (i+1))
 
     encoder.train(False)
     decoder.train(False)
 
 def main():
-    # args = parse_args()
 
     data = LabeledDataset(stdin)
     loader = DataLoader(data, batch_size=128)
@@ -189,7 +131,6 @@ def main():
         decoder = decoder.cuda()
 
     train(encoder, decoder, loader)
-
 
 if __name__ == '__main__':
     use_cuda = torch.cuda.is_available()
